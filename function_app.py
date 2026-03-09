@@ -9,6 +9,62 @@ from datetime import datetime, timezone
 
 app = func.FunctionApp()
 
+def extract_radiation_values(data: dict) -> list[dict]:
+    results = []
+
+    try:
+        response = data.get("response", {})
+        body = response.get("body", {})
+        items = body.get("items", {})
+        item_list = items.get("item", [])
+
+        if isinstance(item_list, dict):
+            item_list = [item_list]
+
+        for item in item_list:
+            value_candidates = [
+                item.get("value"),
+                item.get("radiorate"),
+                item.get("dose"),
+                item.get("radioactivity"),
+            ]
+
+            numeric_value = None
+            for v in value_candidates:
+                if v is None:
+                    continue
+                try:
+                    numeric_value = float(v)
+                    break
+                except Exception:
+                    pass
+
+            if numeric_value is not None:
+                results.append({
+                    "location": item.get("expl") or item.get("name") or "unknown",
+                    "value": numeric_value,
+                    "raw": item
+                })
+
+    except Exception as e:
+        logging.error(f"방사선량 추출 실패: {e}")
+
+    return results
+
+
+def post_to_alert_function(alert_url: str | None, payload: dict) -> None:
+    if not alert_url:
+        logging.warning("ALERT_FUNCTION_URL 이 설정되지 않아 POST 생략")
+        return
+
+    try:
+        resp = requests.post(alert_url, json=payload, timeout=10)
+        if resp.status_code >= 300:
+            logging.error(f"Alert Function 호출 실패: {resp.status_code} / {resp.text}")
+        else:
+            logging.info(f"Alert Function 호출 성공: {resp.status_code}")
+    except Exception as e:
+        logging.error(f"Alert Function POST 오류: {e}")
 
 def send_teams_notification(webhook_url: str | None, message: str) -> None:
     """Teams 채널로 웹훅 알림 전송"""
@@ -134,6 +190,20 @@ def khnp_to_eventhub(timer: func.TimerRequest) -> None:
                         batch = producer.create_batch(partition_id=pid)
                         batch.add(EventData(json.dumps(event_body, ensure_ascii=False)))
                         producer.send_batch(batch)
+                        if api_name == "radiorate":
+                            radiation_items = extract_radiation_values(data)
+
+                            for item in radiation_items:
+                                if item["value"] >= 1000:   # 기준치
+
+                                    alert_payload = {
+                                        "plant_code": g_name
+                                    }
+
+                                    post_to_alert_function(
+                                        os.getenv("ALERT_FUNCTION_URL"),
+                                        alert_payload
+                                    )
                     else:
                         fail_details.append(f"- {api_name} ({g_name}): Status {status}")
                         logging.error(f"실패: {api_name}-{g_name} (Status {status})")
